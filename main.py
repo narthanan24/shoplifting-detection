@@ -94,160 +94,12 @@ class ShopliftingDetector:
                 nearby.append(item)
         return nearby
     
-    def _check_item_taken_from_shelf(self, track_id: int, frame_num: int, 
-                                     fps: float, video_info: Dict) -> Tuple[bool, float]:
-        """
-        Check if an item was taken from shelf and person is leaving (not returning).
-        Distinguishes between returning items vs taking and leaving.
-        Returns (is_theft, timestamp) if detected.
-        """
-        lookback_frames = int(self.item_disappear_buffer * fps * 4)
-        start_frame = max(0, frame_num - lookback_frames)
-        
-        # Track shelf items over time and person position
-        shelf_item_counts = []  # List of (frame_num, item_count) tuples
-        person_positions = []  # List of (frame_num, near_shelf) tuples
-        
-        # Count items on shelves and track person position
-        for f_item_idx in range(len(self.frame_items)):
-            frame_num_items, items = self.frame_items[f_item_idx]
-            if start_frame <= frame_num_items <= frame_num:
-                shelf_items = [item for item in items if self._is_near_shelf(item['bbox'])]
-                shelf_item_counts.append((frame_num_items, len(shelf_items)))
-        
-        # Track person's position relative to shelf
-        for f_idx in range(len(self.frame_persons)):
-            frame_num_hist, persons = self.frame_persons[f_idx]
-            if start_frame <= frame_num_hist <= frame_num:
-                person = next((p for p in persons if p['track_id'] == track_id), None)
-                if person:
-                    is_near = self._is_near_shelf(person['bbox'])
-                    person_positions.append((frame_num_hist, is_near))
-        
-        if len(shelf_item_counts) < 10 or len(person_positions) < 10:
-            return False, 0.0  # Not enough history
-        
-        # Look for pattern: item count decreases, person was near, then person leaves and doesn't return
-        # This distinguishes theft (take and leave) from returning (take, then come back)
-        
-        # Find when item count decreased
-        for i in range(1, len(shelf_item_counts)):
-            prev_frame, prev_count = shelf_item_counts[i-1]
-            curr_frame, curr_count = shelf_item_counts[i]
-            
-            if prev_count > curr_count:  # Item disappeared
-                # Check if person was near shelf when item disappeared
-                person_was_near_when_taken = False
-                for pos_frame, is_near in person_positions:
-                    if abs(pos_frame - curr_frame) <= 10:  # Within 10 frames
-                        if is_near:
-                            person_was_near_when_taken = True
-                            break
-                
-                if person_was_near_when_taken:
-                    # Check if person leaves and doesn't return (theft pattern)
-                    # vs returns to shelf (returning item pattern)
-                    frames_after = 60  # Check next 2 seconds (60 frames at 30fps)
-                    person_returned = False
-                    person_left = False
-                    
-                    for pos_frame, is_near in person_positions:
-                        if curr_frame < pos_frame <= curr_frame + frames_after:
-                            if not is_near:
-                                person_left = True
-                            elif is_near and person_left:
-                                # Person left then came back - likely returning item, not theft
-                                person_returned = True
-                                break
-                    
-                    # If person left and didn't return within reasonable time, it's theft
-                    if person_left and not person_returned:
-                        # Additional check: look ahead to see if person stays away
-                        lookahead_frames = 90  # 3 seconds
-                        stayed_away = True
-                        for pos_frame, is_near in person_positions:
-                            if curr_frame < pos_frame <= curr_frame + lookahead_frames:
-                                if is_near:
-                                    stayed_away = False
-                                    break
-                        
-                        if stayed_away:
-                            timestamp = frame_to_timestamp(curr_frame, fps)
-                            return True, timestamp
-        
-        return False, 0.0
-    
-    def _analyze_full_timeline_for_theft(self, fps: float, video_info: Dict) -> List[Dict]:
-        """
-        Post-process the entire video timeline to find theft patterns.
-        Looks for: item count decreases, person was near, person leaves and doesn't return.
-        """
-        theft_events = []
-        
-        # Analyze item counts over time per track
-        track_ids = set()
-        for _, persons in self.frame_persons:
-            for person in persons:
-                track_ids.add(person['track_id'])
-        
-        for track_id in track_ids:
-            # Build timeline of item counts and person positions
-            timeline = []  # List of (frame_num, item_count, person_near_shelf)
-            
-            for f_item_idx in range(len(self.frame_items)):
-                frame_num_items, items = self.frame_items[f_item_idx]
-                shelf_items = [item for item in items if self._is_near_shelf(item['bbox'])]
-                item_count = len(shelf_items)
-                
-                # Find if person was near shelf at this frame
-                person_near = False
-                for f_idx in range(len(self.frame_persons)):
-                    frame_num_persons, persons = self.frame_persons[f_idx]
-                    if frame_num_persons == frame_num_items:
-                        person = next((p for p in persons if p['track_id'] == track_id), None)
-                        if person and self._is_near_shelf(person['bbox']):
-                            person_near = True
-                            break
-                
-                timeline.append((frame_num_items, item_count, person_near))
-            
-            if len(timeline) < 20:
-                continue
-            
-            # Look for pattern: item count drops, person was near, then person leaves
-            for i in range(10, len(timeline) - 30):  # Need enough history and future
-                prev_frame, prev_count, prev_near = timeline[i-1]
-                curr_frame, curr_count, curr_near = timeline[i]
-                
-                # Item count decreased and person was near
-                if prev_count > curr_count and prev_near:
-                    # Check if person leaves and doesn't return
-                    person_left = False
-                    person_returned = False
-                    
-                    for j in range(i+1, min(i+90, len(timeline))):  # Check next 3 seconds
-                        _, _, near = timeline[j]
-                        if not near:
-                            person_left = True
-                        elif near and person_left:
-                            person_returned = True
-                            break
-                    
-                    # If person left and didn't return, it's theft
-                    if person_left and not person_returned:
-                        start_time = max(0, frame_to_timestamp(curr_frame, fps) - 3.0)
-                        end_time = min(video_info['duration'], frame_to_timestamp(curr_frame, fps) + 7.0)
-                        
-                        theft_events.append({
-                            'track_id': track_id,
-                            'start_time': start_time,
-                            'end_time': end_time,
-                            'reason': 'Item taken from shelf and person left (theft detected)'
-                        })
-                        break  # Only one theft event per person
-        
-        return theft_events
-    
+    def _check_overlap(self, bbox1: List[float], bbox2: List[float]) -> bool:
+        """Check if two bounding boxes overlap."""
+        x1_1, y1_1, x2_1, y2_1 = bbox1
+        x1_2, y1_2, x2_2, y2_2 = bbox2
+        return not (x1_1 > x2_2 or x2_1 < x1_2 or y1_1 > y2_2 or y2_1 < y1_2)
+
     def _check_person_exits_soon(self, track_id: int, frame_num: int, 
                                  total_frames: int, fps: float,
                                  current_tracked_persons: List[Dict]) -> bool:
@@ -277,7 +129,7 @@ class ShopliftingDetector:
         # In a real implementation, you'd check frame boundaries and movement direction
         return True  # Simplified: if item disappeared near person, flag as suspicious
     
-    def process_video(self, video_path: str) -> List[Dict]:
+    def process_video(self, video_path: str) -> Tuple[List[Dict], Dict]:
         """
         Process video and detect suspicious behavior.
         
@@ -325,6 +177,9 @@ class ShopliftingDetector:
             tracked_persons = self.tracker.update(detections)
             
             # Store frame data for analysis
+            # Split bags and objects
+            bags = [d for d in items if d['type'] in ['backpack', 'handbag']]
+            objects = [d for d in items if d['type'] not in ['backpack', 'handbag']]
             self.frame_items.append((frame_num, items))
             self.frame_persons.append((frame_num, tracked_persons))
             
@@ -355,13 +210,46 @@ class ShopliftingDetector:
                     person_near_shelf_time[track_id] += (1.0 / fps)
                     
                     # Check for items near person while at shelf
-                    nearby_items = self._find_nearby_items(person['bbox'], items, threshold=200.0)
-                    if nearby_items:
+                    nearby_items = self._find_nearby_items(person['bbox'], objects, threshold=200.0)
+                    
+                    # Check bag interactions and pocket zone
+                    bag_interaction = False
+                    item_in_pocket_zone = False
+                    
+                    for obj in objects:
+                        # Check pocket zone (item completely inside person's bounding box)
+                        ox1, oy1, ox2, oy2 = obj['bbox']
+                        px1, py1, px2, py2 = person['bbox']
+                        
+                        # Add a small margin to account for YOLO bounding box tightness
+                        margin_x = (px2 - px1) * 0.05
+                        margin_y = (py2 - py1) * 0.05
+                        
+                        is_inside = (ox1 >= px1 - margin_x and ox2 <= px2 + margin_x and 
+                                     oy1 >= py1 - margin_y and oy2 <= py2 + margin_y)
+                                     
+                        # Also require it to be centrally located to avoid edge holding
+                        person_center_x = (px1 + px2) / 2
+                        obj_center_x = (ox1 + ox2) / 2
+                        is_central = abs(obj_center_x - person_center_x) < (px2 - px1) * 0.3
+                        
+                        if is_inside and is_central:
+                            item_in_pocket_zone = True
+                            
+                        # Check bag
+                        for bag in bags:
+                            if self._check_overlap(person['bbox'], bag['bbox']):
+                                if self._check_overlap(bag['bbox'], obj['bbox']):
+                                    bag_interaction = True
+                    
+                    if nearby_items or bag_interaction or item_in_pocket_zone:
                         self.person_item_interactions[track_id].append({
                             'frame': frame_num,
                             'timestamp': timestamp,
                             'items_count': len(nearby_items),
-                            'near_shelf': True
+                            'near_shelf': True,
+                            'bag_interaction': bag_interaction,
+                            'item_in_pocket_zone': item_in_pocket_zone
                         })
                 else:
                     # Person moved away from shelf - check if they were there before
@@ -394,7 +282,7 @@ class ShopliftingDetector:
                 
                 # Heuristic 1: Person stays near shelves too long (less sensitive, only if no item interaction)
                 # Skip this if we're detecting actual theft patterns (Heuristic 2)
-                if person_near_shelf_time[track_id] >= self.time_near_shelf_threshold * 2:  # Double threshold
+                if person_near_shelf_time[track_id] >= self.time_near_shelf_threshold:  # Use base threshold
                     # Only flag if person hasn't had clear item interactions (to avoid false positives on returns)
                     has_item_interaction = any(
                         interaction.get('items_count', 0) > 0 
@@ -419,91 +307,40 @@ class ShopliftingDetector:
                                 'reason': f'Stayed near shelves for {person_near_shelf_time[track_id]:.1f}s'
                             })
                 
-                # Heuristic 2: Item taken from shelf and person leaves (actual theft) - PRIORITY
-                is_theft, theft_timestamp = self._check_item_taken_from_shelf(
-                    track_id, frame_num, fps, video_info
-                )
-                if is_theft:
-                    # Calculate event time window around the theft
-                    start_time = max(0, theft_timestamp - 3.0)  # 3 seconds before to show approach
-                    end_time = min(video_info['duration'], timestamp + 6.0)  # Include full walk-away
+                # Heuristic 4: Bag/Pocket Concealment & Dropped Items
+                history = self.person_item_interactions[track_id]
+                
+                # Bag Concealment: Item touching bag for multiple frames
+                bag_interactions = sum(1 for h in history[-30:] if h.get('bag_interaction', False))
+                
+                # Sustained Item Disappearance (Pocket):
+                # Count dropped significantly AND it was in pocket zone before dropping
+                pocket_concealment = False
+                if len(history) >= 30:
+                    recent = history[-15:]
+                    older = history[-45:-15] if len(history) >= 45 else history[-30:-15]
+                    avg_older = sum(h.get('items_count', 0) for h in older) / len(older)
+                    avg_recent = sum(h.get('items_count', 0) for h in recent) / len(recent)
                     
-                    # Remove any existing events for this person that might be false positives
-                    self.suspicious_events = [
-                        e for e in self.suspicious_events 
-                        if not (e['track_id'] == track_id and 
-                               'Stayed near shelves' in e['reason'])
-                    ]
-                    
+                    if avg_older >= 1.0 and avg_recent <= avg_older - 0.7:
+                        # Strongly require that it was in the pocket zone recently
+                        if any(h.get('item_in_pocket_zone', False) for h in older[-15:]):
+                            pocket_concealment = True
+                
+                if bag_interactions >= 5 or pocket_concealment:
+                    start_time = max(0, timestamp - 3.0)
+                    end_time = min(video_info['duration'], timestamp + 3.0)
                     existing = next((e for e in self.suspicious_events 
                                    if e['track_id'] == track_id and 
-                                   abs(e['start_time'] - start_time) < 2.0), None)
-                    
+                                   abs(e['start_time'] - start_time) < 3.0), None)
                     if not existing:
+                        reason = 'Item concealed in bag' if bag_interactions >= 5 else 'Item concealed in pocket'
                         self.suspicious_events.append({
                             'track_id': track_id,
                             'start_time': start_time,
                             'end_time': end_time,
-                            'reason': 'Item taken from shelf and person left (theft detected)'
+                            'reason': reason
                         })
-                
-                # Heuristic 3: Person near shelf and then moves away quickly (grab and go)
-                if person_near_shelf_time[track_id] > 1.5:  # Was near shelf for at least 1.5 seconds
-                    # Check if person is moving away from shelf
-                    if not self._is_near_shelf(person['bbox']):
-                        # Check if person had item interactions
-                        had_item_interaction = any(
-                            interaction.get('items_count', 0) > 0 
-                            for interaction in self.person_item_interactions[track_id]
-                            if interaction.get('near_shelf', False)
-                        )
-                        
-                        # Person was near shelf but now moved away - could be suspicious
-                        start_time = max(0, timestamp - 4.0)  # Include more context before
-                        end_time = min(video_info['duration'], timestamp + 3.0)  # Include walk-away
-                        
-                        existing = next((e for e in self.suspicious_events 
-                                       if e['track_id'] == track_id and 
-                                       abs(e['start_time'] - start_time) < 3.0), None)
-                        
-                        if not existing:
-                            reason = f'Person was near shelf ({person_near_shelf_time[track_id]:.1f}s) then moved away'
-                            if had_item_interaction:
-                                reason += ' (after item interaction - possible theft)'
-                            
-                            self.suspicious_events.append({
-                                'track_id': track_id,
-                                'start_time': start_time,
-                                'end_time': end_time,
-                                'reason': reason
-                            })
-                
-                # Heuristic 4: Detect item disappearance pattern (item was near person, then gone)
-                # This catches the concealment action
-                if len(self.person_item_interactions[track_id]) >= 2:
-                    recent_interactions = self.person_item_interactions[track_id][-2:]
-                    prev_interaction = recent_interactions[0]
-                    curr_interaction = recent_interactions[1]
-                    
-                    # If person had items near them at shelf, then items decreased/disappeared
-                    if (prev_interaction.get('near_shelf', False) and 
-                        prev_interaction.get('items_count', 0) > 0 and
-                        curr_interaction.get('items_count', 0) < prev_interaction.get('items_count', 0)):
-                        
-                        start_time = max(0, prev_interaction.get('timestamp', timestamp) - 2.0)
-                        end_time = min(video_info['duration'], curr_interaction.get('timestamp', timestamp) + 4.0)
-                        
-                        existing = next((e for e in self.suspicious_events 
-                                       if e['track_id'] == track_id and 
-                                       abs(e['start_time'] - start_time) < 2.0), None)
-                        
-                        if not existing:
-                            self.suspicious_events.append({
-                                'track_id': track_id,
-                                'start_time': start_time,
-                                'end_time': end_time,
-                                'reason': 'Item disappeared near person (possible concealment/theft)'
-                            })
             
             frame_num += 1
             
@@ -513,21 +350,7 @@ class ShopliftingDetector:
         
         cap.release()
         
-        # Post-process: Analyze full timeline for theft patterns
-        print("\nAnalyzing full video timeline for theft patterns...")
-        theft_events = self._analyze_full_timeline_for_theft(fps, video_info)
-        
-        # Prioritize theft events - remove false positives and keep only theft events
-        if theft_events:
-            # Remove non-theft events for the same person
-            for theft_event in theft_events:
-                self.suspicious_events = [
-                    e for e in self.suspicious_events 
-                    if not (e['track_id'] == theft_event['track_id'] and 
-                           'Stayed near shelves' in e['reason'] and
-                           'theft' not in e['reason'].lower())
-                ]
-                self.suspicious_events.append(theft_event)
+
         
         # Merge overlapping events and extend windows
         if self.suspicious_events:
@@ -570,7 +393,7 @@ class ShopliftingDetector:
             
             self.suspicious_events = merged_events
         
-        return self.suspicious_events
+        return self.suspicious_events, self.person_movement_history
 
 
 def main():
@@ -584,8 +407,8 @@ def main():
     parser.add_argument('--shelf-region', type=int, nargs=4, metavar=('X1', 'Y1', 'X2', 'Y2'),
                        default=None,
                        help='Shelf region coordinates (x1 y1 x2 y2). If not specified, entire frame is used.')
-    parser.add_argument('--time-threshold', type=float, default=5.0,
-                       help='Time in seconds person must stay near shelves (default: 5.0)')
+    parser.add_argument('--time-threshold', type=float, default=15.0,
+                       help='Time in seconds person must stay near shelves (default: 15.0)')
     parser.add_argument('--item-buffer', type=float, default=3.0,
                        help='Buffer time for item disappearance check (default: 3.0)')
     parser.add_argument('--exit-buffer', type=float, default=5.0,
@@ -612,7 +435,7 @@ def main():
     print("=" * 60)
     print("Shoplifting Detection System")
     print("=" * 60)
-    suspicious_events = detector.process_video(str(video_path))
+    suspicious_events, trajectories = detector.process_video(str(video_path))
     
     if not suspicious_events:
         print("\nNo suspicious behavior detected.")
@@ -644,11 +467,12 @@ def main():
         clips_to_extract.append((
             event['start_time'],
             event['end_time'],
-            output_filename
+            output_filename,
+            event['track_id']
         ))
     
-    print(f"\nExtracting {len(clips_to_extract)} clip(s)...")
-    extracted_paths = clipper.extract_clips(str(video_path), clips_to_extract)
+    print(f"\nExtracting {len(clips_to_extract)} annotated clip(s)...")
+    extracted_paths = clipper.extract_annotated_clips(str(video_path), clips_to_extract, trajectories)
     
     # Print summary
     print("\n" + "=" * 60)

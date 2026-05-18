@@ -5,11 +5,11 @@ A Python-based system for detecting suspicious shoplifting-like activity in CCTV
 ## Features
 
 - **Person & Object Detection**: Uses YOLOv8 pretrained model to detect persons, backpacks, handbags, bottles, and other items
-- **Person Tracking**: Tracks persons across frames using ByteTrack algorithm
+- **Person Tracking**: Tracks persons across frames using the ByteTrack algorithm
 - **Suspicious Behavior Detection**: Flags suspicious activity based on heuristics:
   - Person stays near shelves longer than threshold (default: 15 seconds)
   - Person picks up an item and item disappears near bag/body
-  - Person exits frame shortly after item disappears
+  - Person exits frame shortly after the item disappears
 - **Video Clip Extraction**: Automatically extracts suspicious segments using FFmpeg
 
 
