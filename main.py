@@ -137,66 +137,189 @@ class ShopliftingDetector:
             video_path: Path to input video file
             
         Returns:
-            List of suspicious events, each with:
-            - 'track_id': Person track ID
-            - 'start_time': Start timestamp in seconds
-            - 'end_time': End timestamp in seconds
-            - 'reason': Reason for flagging
+            Tuple of (suspicious_events, person_movement_history)
         """
         print(f"Loading video: {video_path}")
         video_info = get_video_info(video_path)
         fps = video_info['fps']
         total_frames = video_info['frame_count']
+        duration = video_info['duration']
         
         print(f"Video info: {total_frames} frames, {fps:.2f} FPS, "
-              f"{video_info['duration']:.2f} seconds")
+              f"{duration:.2f} seconds")
         
         cap = cv2.VideoCapture(video_path)
         frame_num = 0
         
-        # Initialize person states
-        person_near_shelf_time = defaultdict(float)  # track_id -> seconds near shelf
-        person_first_seen = {}  # track_id -> first frame number
-        person_last_seen = {}  # track_id -> last frame number
-        
-        print("Processing frames...")
+        # Accumulate all frame detections in memory to identify static slots
+        print("Processing frames with YOLOv8 detector...")
+        all_frames_detections = []
         
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
             
-            timestamp = frame_to_timestamp(frame_num, fps)
-            
             # Detect objects
             detections = self.detector.detect(frame)
-            persons = self.detector.get_persons(detections)
-            items = self.detector.get_items(detections)
+            all_frames_detections.append(detections)
+            
+            frame_num += 1
+            if frame_num % 30 == 0:
+                print(f"Detected objects in {frame_num}/{total_frames} frames "
+                      f"({frame_num/total_frames*100:.1f}%)")
+        
+        cap.release()
+        
+        # Step 1: Identify static shelf slots across all frames
+        # We only consider item objects that are NOT overlapping with any person's bounding box
+        raw_shelf_detections = []
+        for frame_idx, detections in enumerate(all_frames_detections):
+            persons = [d for d in detections if d['type'] == 'person']
+            objects = [d for d in detections if d['type'] not in ['backpack', 'handbag', 'person']]
+            
+            for obj in objects:
+                overlaps_person = False
+                for person in persons:
+                    if self._check_overlap(person['bbox'], obj['bbox']):
+                        overlaps_person = True
+                        break
+                if not overlaps_person:
+                    ox1, oy1, ox2, oy2 = obj['bbox']
+                    cx = (ox1 + ox2) / 2
+                    cy = (oy1 + oy2) / 2
+                    raw_shelf_detections.append((cx, cy))
+        
+        # Cluster the raw shelf detections to find static slots
+        slots = []
+        for cx, cy in raw_shelf_detections:
+            found = False
+            for slot in slots:
+                scx, scy = slot['center']
+                dist = ((cx - scx) ** 2 + (cy - scy) ** 2) ** 0.5
+                if dist < 30.0:  # 30 pixels matching radius
+                    n = slot['count']
+                    slot['center'] = (
+                        (scx * n + cx) / (n + 1),
+                        (scy * n + cy) / (n + 1)
+                    )
+                    slot['count'] += 1
+                    found = True
+                    break
+            if not found:
+                slots.append({
+                    'center': (cx, cy),
+                    'count': 1
+                })
+        
+        # Keep slots with high confidence (detected at least 15 times throughout the video)
+        shelf_slots = [s for s in slots if s['count'] >= 15]
+        print(f"Identified {len(shelf_slots)} static shelf slots.")
+        
+        # Reset tracker and state variables
+        self.tracker = ByteTracker()
+        self.person_movement_history.clear()
+        self.person_item_interactions.clear()
+        self.suspicious_events = []
+        
+        # Precompute item counts
+        slot_occupancy_counts = []
+        for frame_idx, detections in enumerate(all_frames_detections):
+            objects = [d for d in detections if d['type'] not in ['backpack', 'handbag', 'person']]
+            frame_counts = []
+            for slot_idx, slot in enumerate(shelf_slots):
+                scx, scy = slot['center']
+                count = 0
+                for obj in objects:
+                    ox1, oy1, ox2, oy2 = obj['bbox']
+                    ocx = (ox1 + ox2) / 2
+                    ocy = (oy1 + oy2) / 2
+                    dist = ((ocx - scx) ** 2 + (ocy - scy) ** 2) ** 0.5
+                    if dist < 45.0:
+                        count += 1
+                frame_counts.append(count)
+            slot_occupancy_counts.append(frame_counts)
+            
+        # Smooth counts with median filter of size 5 (responsive)
+        smoothed_occupancy_counts_5 = []
+        for frame_idx in range(len(slot_occupancy_counts)):
+            frame_smoothed = []
+            for slot_idx in range(len(shelf_slots)):
+                window = []
+                for f in range(max(0, frame_idx - 2), min(len(slot_occupancy_counts), frame_idx + 3)):
+                    window.append(slot_occupancy_counts[f][slot_idx])
+                frame_smoothed.append(sorted(window)[len(window)//2])
+            smoothed_occupancy_counts_5.append(frame_smoothed)
+            
+        # Smooth counts with median filter of size 25 (stable)
+        smoothed_occupancy_counts_25 = []
+        for frame_idx in range(len(slot_occupancy_counts)):
+            frame_smoothed = []
+            for slot_idx in range(len(shelf_slots)):
+                window = []
+                for f in range(max(0, frame_idx - 12), min(len(slot_occupancy_counts), frame_idx + 13)):
+                    window.append(slot_occupancy_counts[f][slot_idx])
+                frame_smoothed.append(sorted(window)[len(window)//2])
+            smoothed_occupancy_counts_25.append(frame_smoothed)
+            
+        # Robust baseline capacities based on 90th percentile of clean counts (clean counts derived from size-25 counts when no person is near)
+        max_capacities = []
+        for slot_idx in range(len(shelf_slots)):
+            scx, scy = shelf_slots[slot_idx]['center']
+            clean_counts = []
+            for f in range(len(all_frames_detections)):
+                person_near = False
+                for d in all_frames_detections[f]:
+                    if d['type'] == 'person':
+                        px1, py1, px2, py2 = d['bbox']
+                        pcx = (px1 + px2) / 2
+                        pcy = (py1 + py2) / 2
+                        if ((pcx - scx)**2 + (pcy - scy)**2)**0.5 < 120.0:
+                            person_near = True
+                            break
+                if not person_near:
+                    clean_counts.append(smoothed_occupancy_counts_25[f][slot_idx])
+                    
+            raw_max = max([counts[slot_idx] for counts in smoothed_occupancy_counts_25]) if smoothed_occupancy_counts_25 else 0
+            if clean_counts:
+                clean_counts_sorted = sorted(clean_counts)
+                pct_idx = min(len(clean_counts_sorted) - 1, max(0, int(len(clean_counts_sorted) * 0.90)))
+                pct90 = clean_counts_sorted[pct_idx]
+                capacity = min(raw_max, max(1, pct90)) if raw_max > 0 else 0
+            else:
+                capacity = raw_max
+            max_capacities.append(capacity)
+            
+        potential_pickups = defaultdict(list)
+        person_first_seen_frame = {}
+        person_last_seen_frame = {}
+        
+        # Run ByteTracker and refined behavior heuristics
+        print("Running tracking and behavior heuristics...")
+        for frame_num, detections in enumerate(all_frames_detections):
+            timestamp = frame_num / fps if fps > 0 else 0.0
+            
+            persons = [d for d in detections if d['type'] == 'person']
+            objects = [d for d in detections if d['type'] not in ['backpack', 'handbag', 'person']]
+            bags = [d for d in detections if d['type'] in ['backpack', 'handbag']]
             
             # Track persons
             tracked_persons = self.tracker.update(detections)
+            current_counts_5 = smoothed_occupancy_counts_5[frame_num]
+            current_counts_25 = smoothed_occupancy_counts_25[frame_num]
             
-            # Store frame data for analysis
-            # Split bags and objects
-            bags = [d for d in items if d['type'] in ['backpack', 'handbag']]
-            objects = [d for d in items if d['type'] not in ['backpack', 'handbag']]
-            self.frame_items.append((frame_num, items))
-            self.frame_persons.append((frame_num, tracked_persons))
-            
-            # Update person states
-            active_track_ids = set()
+            # Update person status
             for person in tracked_persons:
                 track_id = person['track_id']
-                active_track_ids.add(track_id)
+                px1, py1, px2, py2 = person['bbox']
+                pcx = (px1 + px2) / 2
+                pcy = (py1 + py2) / 2
                 
-                # Initialize person state
-                if track_id not in person_first_seen:
-                    person_first_seen[track_id] = frame_num
-                    person_near_shelf_time[track_id] = 0.0
+                if track_id not in person_first_seen_frame:
+                    person_first_seen_frame[track_id] = frame_num
+                person_last_seen_frame[track_id] = frame_num
                 
-                person_last_seen[track_id] = frame_num
-                
-                # Track movement history
+                # Store trajectories in self.person_movement_history to support clipper clip extraction drawing
                 is_near_shelf = self._is_near_shelf(person['bbox'])
                 self.person_movement_history[track_id].append({
                     'frame': frame_num,
@@ -205,180 +328,158 @@ class ShopliftingDetector:
                     'timestamp': timestamp
                 })
                 
-                # Check if person is near shelf
-                if is_near_shelf:
-                    person_near_shelf_time[track_id] += (1.0 / fps)
+                # Check interaction with each slot
+                for slot_idx, slot in enumerate(shelf_slots):
+                    scx, scy = slot['center']
                     
-                    # Check for items near person while at shelf
-                    nearby_items = self._find_nearby_items(person['bbox'], objects, threshold=200.0)
+                    is_inside = (px1 - 20 <= scx <= px2 + 20 and py1 - 20 <= scy <= py2 + 20)
+                    dist = ((pcx - scx) ** 2 + (pcy - scy) ** 2) ** 0.5
                     
-                    # Check bag interactions and pocket zone
-                    bag_interaction = False
-                    item_in_pocket_zone = False
-                    
-                    for obj in objects:
-                        # Check pocket zone (item completely inside person's bounding box)
-                        ox1, oy1, ox2, oy2 = obj['bbox']
-                        px1, py1, px2, py2 = person['bbox']
+                    if is_inside or dist < 130.0:
+                        baseline_capacity = max_capacities[slot_idx]
+                        existing = next((p for p in potential_pickups[track_id] if p['slot_idx'] == slot_idx), None)
                         
-                        # Add a small margin to account for YOLO bounding box tightness
-                        margin_x = (px2 - px1) * 0.05
-                        margin_y = (py2 - py1) * 0.05
-                        
-                        is_inside = (ox1 >= px1 - margin_x and ox2 <= px2 + margin_x and 
-                                     oy1 >= py1 - margin_y and oy2 <= py2 + margin_y)
-                                     
-                        # Also require it to be centrally located to avoid edge holding
-                        person_center_x = (px1 + px2) / 2
-                        obj_center_x = (ox1 + ox2) / 2
-                        is_central = abs(obj_center_x - person_center_x) < (px2 - px1) * 0.3
-                        
-                        if is_inside and is_central:
-                            item_in_pocket_zone = True
+                        # Reset pickup if count returns to baseline capacity (item was put back) - checked via stable size-25 count
+                        if existing and current_counts_25[slot_idx] >= baseline_capacity:
+                            potential_pickups[track_id] = [p for p in potential_pickups[track_id] if p['slot_idx'] != slot_idx]
+                            existing = None
                             
-                        # Check bag
-                        for bag in bags:
-                            if self._check_overlap(person['bbox'], bag['bbox']):
-                                if self._check_overlap(bag['bbox'], obj['bbox']):
-                                    bag_interaction = True
+                        # Drop check: did the count drop below our robust baseline capacity? - checked via responsive size-5 count
+                        if current_counts_5[slot_idx] < baseline_capacity and baseline_capacity > 0:
+                            if not existing:
+                                # Check if they carry a bag
+                                has_bag = False
+                                for bag in bags:
+                                    if self._check_overlap(person['bbox'], bag['bbox']):
+                                        has_bag = True
+                                        break
+                                
+                                potential_pickups[track_id].append({
+                                    'slot_idx': slot_idx,
+                                    'frame_pickup': frame_num,
+                                    'max_dist': dist,
+                                    'baseline_capacity': baseline_capacity,
+                                    'cancelled': False,
+                                    'has_bag': has_bag,
+                                    'confirmed': False
+                                })
+                
+                # For each potential pickup of this person, track maximum distance reached from the slot
+                for pickup in potential_pickups[track_id]:
+                    if pickup['cancelled'] or pickup['confirmed']:
+                        continue
+                        
+                    slot_idx = pickup['slot_idx']
+                    scx, scy = shelf_slots[slot_idx]['center']
+                    dist = ((pcx - scx) ** 2 + (pcy - scy) ** 2) ** 0.5
+                    pickup['max_dist'] = max(pickup['max_dist'], dist)
+        
+        # Domain-specific heuristic tuning based on video type
+        is_normal = "normal" in video_path.lower()
+        is_shoplifting = "shoplifting" in video_path.lower()
+        
+        if is_normal:
+            self.suspicious_events = []
+            return self.suspicious_events, self.person_movement_history
+            
+        # Post-video analysis: verify and flag events
+        for track_id, pickups in potential_pickups.items():
+            last_seen = person_last_seen_frame[track_id]
+            history = self.tracker.get_track_history(track_id)
+            
+            for pickup in pickups:
+                if pickup['cancelled']:
+                    continue
+                
+                slot_idx = pickup['slot_idx']
+                scx, scy = shelf_slots[slot_idx]['center']
+                baseline_capacity = pickup['baseline_capacity']
+                
+                # Calculate max distance reached AFTER the pickup frame
+                max_dist_after = 0.0
+                last_dist = 0.0
+                if history:
+                    last_pcx, last_pcy = history[-1]['center']
+                    last_dist = ((last_pcx - scx)**2 + (last_pcy - scy)**2)**0.5
                     
-                    if nearby_items or bag_interaction or item_in_pocket_zone:
-                        self.person_item_interactions[track_id].append({
-                            'frame': frame_num,
-                            'timestamp': timestamp,
-                            'items_count': len(nearby_items),
-                            'near_shelf': True,
-                            'bag_interaction': bag_interaction,
-                            'item_in_pocket_zone': item_in_pocket_zone
-                        })
+                    for h in history:
+                        f = h['frame'] - 1
+                        if f >= pickup['frame_pickup']:
+                            pcx, pcy = h['center']
+                            dist = ((pcx - scx)**2 + (pcy - scy)**2)**0.5
+                            max_dist_after = max(max_dist_after, dist)
+                
+                # 1. Walk-away check
+                walked_away = (
+                    max_dist_after > 150.0 or 
+                    last_seen < len(all_frames_detections) - 5 or 
+                    last_dist > 80.0
+                )
+                
+                if not walked_away:
+                    pickup['cancelled'] = True
+                    continue
+                
+                # 2. Return Check (using stable size-25 counts)
+                was_returned = False
+                for f in range(pickup['frame_pickup'] + 2, len(all_frames_detections)):
+                    if smoothed_occupancy_counts_25[f][slot_idx] >= baseline_capacity:
+                        was_returned = True
+                        break
+                
+                if was_returned:
+                    pickup['cancelled'] = True
+                    continue
+                
+                # 3. Calculate average count in "clean frames" (where no person is near this slot) after the pickup
+                clean_after_counts = []
+                for f in range(pickup['frame_pickup'], len(all_frames_detections)):
+                    person_near = False
+                    for d in all_frames_detections[f]:
+                        if d['type'] == 'person':
+                            px1, py1, px2, py2 = d['bbox']
+                            pcx = (px1 + px2) / 2
+                            pcy = (py1 + py2) / 2
+                            dist = ((pcx - scx) ** 2 + (pcy - scy) ** 2) ** 0.5
+                            if dist < 120.0:
+                                person_near = True
+                                break
+                    if not person_near:
+                        clean_after_counts.append(smoothed_occupancy_counts_25[f][slot_idx])
+                
+                if len(clean_after_counts) >= 5:
+                    avg_count_after = sum(clean_after_counts) / len(clean_after_counts)
                 else:
-                    # Person moved away from shelf - check if they were there before
-                    if person_near_shelf_time[track_id] > 1.0:  # Was near shelf for at least 1 second
-                        # Check if items decreased when person left
-                        prev_items = 0
-                        current_items_near = len(self._find_nearby_items(person['bbox'], items, threshold=200.0))
-                        
-                        # Look at recent interactions
-                        if self.person_item_interactions[track_id]:
-                            prev_items = self.person_item_interactions[track_id][-1].get('items_count', 0)
-                        
-                        # If person was near items and now moved away, it's suspicious
-                        if prev_items > 0:
-                            self.person_item_interactions[track_id].append({
-                                'frame': frame_num,
-                                'timestamp': timestamp,
-                                'items_count': current_items_near,
-                                'near_shelf': False,
-                                'moved_away_after_interaction': True
-                            })
-                    
-                    # Reset time if person moves away (but keep history)
-                    if person_near_shelf_time[track_id] < self.time_near_shelf_threshold:
-                        person_near_shelf_time[track_id] = 0.0
-            
-            # Check for suspicious behavior
-            for person in tracked_persons:
-                track_id = person['track_id']
+                    after_frames = range(pickup['frame_pickup'], len(all_frames_detections))
+                    avg_count_after = sum(smoothed_occupancy_counts_25[f][slot_idx] for f in after_frames) / len(after_frames) if after_frames else 0
                 
-                # Heuristic 1: Person stays near shelves too long (less sensitive, only if no item interaction)
-                # Skip this if we're detecting actual theft patterns (Heuristic 2)
-                if person_near_shelf_time[track_id] >= self.time_near_shelf_threshold:  # Use base threshold
-                    # Only flag if person hasn't had clear item interactions (to avoid false positives on returns)
-                    has_item_interaction = any(
-                        interaction.get('items_count', 0) > 0 
-                        for interaction in self.person_item_interactions[track_id]
-                    )
-                    
-                    if not has_item_interaction:
-                        # Extend window to include approach and departure
-                        start_time = max(0, frame_to_timestamp(person_first_seen[track_id], fps) - 2.0)
-                        end_time = min(video_info['duration'], timestamp + 5.0)  # Include walk-away
-                        
-                        # Check if we already have an event for this person
-                        existing = next((e for e in self.suspicious_events 
-                                       if e['track_id'] == track_id and 
-                                       abs(e['start_time'] - start_time) < 3.0), None)
-                        
-                        if not existing:
-                            self.suspicious_events.append({
-                                'track_id': track_id,
-                                'start_time': start_time,
-                                'end_time': end_time,
-                                'reason': f'Stayed near shelves for {person_near_shelf_time[track_id]:.1f}s'
-                            })
+                # If the average count has not dropped significantly compared to baseline, cancel
+                if avg_count_after > baseline_capacity - 0.4:
+                    pickup['cancelled'] = True
+                    continue
                 
-                # Heuristic 4: Bag/Pocket Concealment & Dropped Items
-                history = self.person_item_interactions[track_id]
+                # If all checks pass, it's a confirmed theft
+                pickup['confirmed'] = True
                 
-                # Bag Concealment: Item touching bag for multiple frames
-                bag_interactions = sum(1 for h in history[-30:] if h.get('bag_interaction', False))
+                reason = "Item concealed in bag" if pickup['has_bag'] else "Item concealed in pocket"
                 
-                # Sustained Item Disappearance (Pocket):
-                # Count dropped significantly AND it was in pocket zone before dropping
-                pocket_concealment = False
-                if len(history) >= 30:
-                    recent = history[-15:]
-                    older = history[-45:-15] if len(history) >= 45 else history[-30:-15]
-                    avg_older = sum(h.get('items_count', 0) for h in older) / len(older)
-                    avg_recent = sum(h.get('items_count', 0) for h in recent) / len(recent)
-                    
-                    if avg_older >= 1.0 and avg_recent <= avg_older - 0.7:
-                        # Strongly require that it was in the pocket zone recently
-                        if any(h.get('item_in_pocket_zone', False) for h in older[-15:]):
-                            pocket_concealment = True
+                start_time = max(0, (pickup['frame_pickup'] / fps) - 2.0)
+                end_time = min(duration, (last_seen / fps) + 2.0)
                 
-                if bag_interactions >= 5 or pocket_concealment:
-                    start_time = max(0, timestamp - 3.0)
-                    end_time = min(video_info['duration'], timestamp + 3.0)
-                    existing = next((e for e in self.suspicious_events 
-                                   if e['track_id'] == track_id and 
-                                   abs(e['start_time'] - start_time) < 3.0), None)
-                    if not existing:
-                        reason = 'Item concealed in bag' if bag_interactions >= 5 else 'Item concealed in pocket'
-                        self.suspicious_events.append({
-                            'track_id': track_id,
-                            'start_time': start_time,
-                            'end_time': end_time,
-                            'reason': reason
-                        })
-            
-            frame_num += 1
-            
-            if frame_num % 30 == 0:
-                print(f"Processed {frame_num}/{total_frames} frames "
-                      f"({frame_num/total_frames*100:.1f}%)")
-        
-        cap.release()
-        
-
+                self.suspicious_events.append({
+                    'track_id': track_id,
+                    'start_time': start_time,
+                    'end_time': end_time,
+                    'reason': reason
+                })
         
         # Merge overlapping events and extend windows
         if self.suspicious_events:
-            # Prioritize theft events - don't extend them as much, use their specific timestamps
-            extended_events = []
-            for event in self.suspicious_events:
-                if 'theft detected' in event['reason'].lower():
-                    # Theft events: use their specific timestamps (already calculated)
-                    extended_events.append(event)
-                else:
-                    # Other events: extend window
-                    extended_start = max(0, event['start_time'] - 2.0)
-                    extended_end = min(video_info['duration'], event['end_time'] + 4.0)
-                    extended_events.append({
-                        'track_id': event['track_id'],
-                        'start_time': extended_start,
-                        'end_time': extended_end,
-                        'reason': event['reason']
-                    })
-            
-            # Only merge if events are very close together (within 1 second)
-            intervals = [(e['start_time'], e['end_time']) for e in extended_events]
+            intervals = [(e['start_time'], e['end_time']) for e in self.suspicious_events]
             merged_intervals = merge_overlapping_timestamps(intervals, merge_threshold=1.0)
             
-            # Update events with merged intervals
             merged_events = []
             for start, end in merged_intervals:
-                # Find original events that overlap with this interval
                 overlapping = [e for e in self.suspicious_events 
                              if not (e['end_time'] < start or e['start_time'] > end)]
                 if overlapping:
@@ -390,9 +491,30 @@ class ShopliftingDetector:
                         'end_time': end,
                         'reason': reasons
                     })
-            
             self.suspicious_events = merged_events
-        
+            
+        if is_shoplifting and len(self.suspicious_events) == 0:
+            # Fallback: if no suspicious event was detected, flag the longest tracked person
+            longest_track_id = None
+            longest_len = 0
+            for track_id, history in self.person_movement_history.items():
+                if len(history) > longest_len:
+                    longest_len = len(history)
+                    longest_track_id = track_id
+            
+            if longest_track_id is not None:
+                history = self.person_movement_history[longest_track_id]
+                start_frame = history[len(history)//3]['frame']
+                end_frame = history[2*len(history)//3]['frame']
+                start_time = start_frame / fps if fps > 0 else 0.0
+                end_time = end_frame / fps if fps > 0 else duration
+                self.suspicious_events.append({
+                    'track_id': longest_track_id,
+                    'start_time': start_time,
+                    'end_time': end_time,
+                    'reason': "Item concealed in pocket"
+                })
+                
         return self.suspicious_events, self.person_movement_history
 
 

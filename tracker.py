@@ -87,10 +87,10 @@ class ByteTracker:
         matched_tracks = set()
         matched_detections = set()
         
-        # First pass: match high confidence detections to confirmed tracks
+        # First pass: match active tracks (age == 0) to detections
         for track_id, track in self.tracks.items():
             if track['age'] > 0:
-                continue  # Skip tracks that were lost
+                continue  # Skip tracks that were lost for this pass
             
             best_iou = 0
             best_det_idx = -1
@@ -114,9 +114,9 @@ class ByteTracker:
                 matched_tracks.add(track_id)
                 matched_detections.add(best_det_idx)
         
-        # Second pass: match remaining detections to unconfirmed tracks
+        # Second pass: match lost/aged tracks (age > 0) to remaining detections
         for track_id, track in self.tracks.items():
-            if track_id in matched_tracks or track['hits'] >= self.min_hits:
+            if track_id in matched_tracks:
                 continue
             
             best_iou = 0
@@ -127,7 +127,19 @@ class ByteTracker:
                     continue
                 
                 iou = self._iou(track['bbox'], det['bbox'])
-                if iou > best_iou and iou > self.iou_threshold:
+                # If no IoU overlap, check center distance as a fallback
+                if iou == 0.0:
+                    tc = self._calculate_center(track['bbox'])
+                    dc = self._calculate_center(det['bbox'])
+                    dist = ((tc[0] - dc[0])**2 + (tc[1] - dc[1])**2)**0.5
+                    # If center is within 100 pixels, consider it a match if it's the best option
+                    if dist < 100.0:
+                        # Convert distance to a pseudo-IoU score (closer = higher)
+                        pseudo_iou = 0.1 * (1.0 - dist / 100.0)
+                        if pseudo_iou > best_iou:
+                            best_iou = pseudo_iou
+                            best_det_idx = det_idx
+                elif iou > best_iou and iou > self.iou_threshold:
                     best_iou = iou
                     best_det_idx = det_idx
             
