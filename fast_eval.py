@@ -348,6 +348,10 @@ class SimulatedDetector:
                     })
             self.suspicious_events = merged_events
             
+        # Select at most one event (the one with the longest duration)
+        if len(self.suspicious_events) > 1:
+            self.suspicious_events = [max(self.suspicious_events, key=lambda e: e['end_time'] - e['start_time'])]
+            
         return self.suspicious_events
 
 

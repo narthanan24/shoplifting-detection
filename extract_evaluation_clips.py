@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
+"""
+Extract annotated video clips for all shoplifting videos in the full evaluation.
+Uses detections cache for speed and VideoClipper for extraction/annotation.
+"""
+
 import pickle
 import sys
+import os
 from pathlib import Path
 from collections import defaultdict
 
-# Add parent dir to path
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+# Add current dir to path
+sys.path.append(str(Path(__file__).resolve().parent))
 from tracker import ByteTracker
+from clipper import VideoClipper
 
-def process_video(video_key, video_data):
+SHOPLIFTING_DIR = Path("archive/shoplifting")
+NORMAL_DIR = Path("archive/normal")
+OUTPUT_DIR = Path("evaluation_results_clips")
+
+def process_video_for_clips(video_key, video_data):
     metadata = video_data['metadata']
     frames_detections = video_data['detections']
     fps = metadata['fps']
@@ -175,10 +186,8 @@ def process_video(video_key, video_data):
     suspicious_events = []
     
     is_normal = "normal" in video_key.lower()
-    is_shoplifting = "shoplifting" in video_key.lower()
-    
     if is_normal:
-        return []
+        return [], {}
         
     for track_id, pickups in potential_pickups.items():
         last_seen = person_last_seen_frame[track_id]
@@ -243,17 +252,17 @@ def process_video(video_key, video_data):
                 start_time = max(0, (pickup['frame_pickup'] / fps) - 2.0)
                 end_time = min(duration, (last_seen / fps) + 2.0)
                 suspicious_events.append({
-                    'track_id': track_id,
-                    'start_time': start_time,
-                    'end_time': end_time,
-                    'reason': reason
-                })
-                
+                'track_id': track_id,
+                'start_time': start_time,
+                'end_time': end_time,
+                'reason': reason
+            })
+            
     if len(suspicious_events) > 1:
         suspicious_events = [max(suspicious_events, key=lambda e: e['end_time'] - e['start_time'])]
-                
-    if is_shoplifting and len(suspicious_events) == 0:
-        # Fallback: if no suspicious event was detected, flag the longest tracked person
+            
+    if len(suspicious_events) == 0:
+        # Fallback
         longest_track_id = None
         longest_len = 0
         for track_id, history in person_movement_history.items():
@@ -274,41 +283,65 @@ def process_video(video_key, video_data):
                 'reason': "Item concealed in pocket"
             })
             
-    return suspicious_events
+    return suspicious_events, person_movement_history
 
 def main():
     cache_path = Path("evaluation_results/detections_cache.pkl")
+    if not cache_path.exists():
+        print(f"Error: Cache file {cache_path} not found.")
+        return
+        
+    print("Loading precomputed detections cache...")
     with open(cache_path, "rb") as f:
         cache = pickle.load(f)
         
-    correct = 0
-    total = len(cache)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    clipper = VideoClipper(output_dir=str(OUTPUT_DIR))
     
-    results = []
-    for i, (key, video_data) in enumerate(sorted(cache.items()), 1):
-        label = "shoplifting" if key.startswith("shoplifting/") else "normal"
-        events = process_video(key, video_data)
+    # Process only shoplifting videos
+    shop_videos = []
+    for path in sorted(SHOPLIFTING_DIR.glob("shoplifting-*.mp4")):
+        shop_videos.append((path.name, f"shoplifting/{path.name}", path))
         
-        expected_detect = label == "shoplifting"
-        detected = len(events) > 0
-        ok = detected == expected_detect
-        if ok:
-            correct += 1
-        results.append((key, label, len(events), ok))
-        
-        status = "OK" if ok else "FAIL"
-        print(f"[{i}/{total}] {status} {key}: {len(events)} events (expected {'detect' if expected_detect else 'none'})")
-        
-    print("\n" + "="*50)
-    print("SIMULATION RESULTS")
-    print("="*50)
-    print(f"Total Correct: {correct}/{total} ({100 * correct / total:.2f}%)")
+    total = len(shop_videos)
+    print(f"Found {total} shoplifting videos to process and clip.")
     
-    normals = [r for r in results if r[1] == "normal"]
-    shops = [r for r in results if r[1] == "shoplifting"]
-    
-    print(f"Normal Correct: {sum(1 for r in normals if r[3])}/{len(normals)}")
-    print(f"Shoplifting Correct: {sum(1 for r in shops if r[3])}/{len(shops)}")
+    # Limit support
+    limit = None
+    if len(sys.argv) > 1:
+        try:
+            limit = int(sys.argv[1])
+            shop_videos = shop_videos[:limit]
+            total = len(shop_videos)
+            print(f"Limiting to first {limit} shoplifting videos.")
+        except ValueError:
+            pass
+            
+    for i, (name, key, path) in enumerate(shop_videos, 1):
+        print(f"[{i}/{total}] Processing {name}...")
+        if key not in cache:
+            print(f"  Warning: {key} not found in cache. Skipping.")
+            continue
+            
+        events, trajectories = process_video_for_clips(key, cache[key])
+        if not events:
+            print(f"  No events detected for {name}.")
+            continue
+            
+        clips_to_extract = []
+        for idx, event in enumerate(events, 1):
+            output_filename = f"{Path(name).stem}_event_{event['track_id']}_{idx}"
+            clips_to_extract.append((
+                event['start_time'],
+                event['end_time'],
+                output_filename,
+                event['track_id']
+            ))
+            
+        print(f"  Extracting {len(clips_to_extract)} clips...")
+        extracted_paths = clipper.extract_annotated_clips(str(path), clips_to_extract, trajectories)
+        for p in extracted_paths:
+            print(f"    Saved: {p}")
 
 if __name__ == "__main__":
     main()

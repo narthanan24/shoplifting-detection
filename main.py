@@ -493,6 +493,10 @@ class ShopliftingDetector:
                     })
             self.suspicious_events = merged_events
             
+        # Select at most one event (the one with the longest duration)
+        if len(self.suspicious_events) > 1:
+            self.suspicious_events = [max(self.suspicious_events, key=lambda e: e['end_time'] - e['start_time'])]
+            
         if is_shoplifting and len(self.suspicious_events) == 0:
             # Fallback: if no suspicious event was detected, flag the longest tracked person
             longest_track_id = None
